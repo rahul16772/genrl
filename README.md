@@ -1,3 +1,18 @@
+<p align="center">
+  🌐 <a href="https://www.gensyn.ai/"><strong>Visit Website</strong></a> &nbsp;&nbsp;
+  🧠 <a href="https://github.com/gensyn-ai/rl-swarm/blob/main/README.md"><strong>RL Swarm</strong></a> &nbsp;&nbsp;
+  ✖️ <a href="https://x.com/gensynai"><strong>X</strong></a> &nbsp;&nbsp;
+  🤗 <a href="https://huggingface.co/Gensyn"><strong>Hugging Face</strong></a> &nbsp;&nbsp;
+  💬 <a href="https://discord.com/invite/bgyDTy39jZ"><strong>Discord</strong></a>
+</p>
+
+<p align="center">
+  🔬 <a href="https://www.gensyn.ai/research"><strong>Research</strong></a> &nbsp;&nbsp;
+  📰 <a href="https://www.gensyn.ai/resources"><strong>Latest News</strong></a> &nbsp;&nbsp;
+  💼 <a href="https://www.gensyn.ai/careers"><strong>Work for Gensyn</strong></a> &nbsp;&nbsp;
+  📊 <a href="https://dashboard.gensyn.ai/"><strong>Dashboard</strong></a>
+</p>
+
 # GenRL-Swarm: Building Flexible, Decentralized Multi-Agent RL Environments
 
 GenRL-Swarm is a framework that provides native support for horizontally scalable, multi-agent, multi-stage RL with decentralized coordination and communication.
