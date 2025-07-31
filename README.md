@@ -1,3 +1,4 @@
+# GenRL: Building Flexible, Decentralized Multi-Agent RL Environments
 <p align="center">
   🌐 <a href="https://www.gensyn.ai/"><strong>Visit Website</strong></a> &nbsp;&nbsp;
   🧠 <a href="https://github.com/gensyn-ai/rl-swarm/blob/main/README.md"><strong>RL Swarm</strong></a> &nbsp;&nbsp;
@@ -13,9 +14,7 @@
   📊 <a href="https://dashboard.gensyn.ai/"><strong>Dashboard</strong></a>
 </p>
 
-# GenRL-Swarm: Building Flexible, Decentralized Multi-Agent RL Environments
-
-GenRL-Swarm is a framework that provides native support for horizontally scalable, multi-agent, multi-stage RL with decentralized coordination and communication.
+GenRL is a framework that provides native support for horizontally scalable, multi-agent, multi-stage RL with decentralized coordination and communication.
 
 ## Customizable Components:
 - **DataManager**: Specifies and manages the particular data your RL environment will use. This could be a text dataset, an image dataset, a chessboard, or something else entirely.
