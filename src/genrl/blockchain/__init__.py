@@ -1,3 +1,3 @@
-from .coordinator import ModalSwarmCoordinator, SwarmCoordinator, WalletSwarmCoordinator
+from .coordinator import SwarmCoordinator
 
-__all__ = ["SwarmCoordinator", "WalletSwarmCoordinator", "ModalSwarmCoordinator"]
+__all__ = ["SwarmCoordinator"]

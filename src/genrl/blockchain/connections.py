@@ -1,3 +1,4 @@
+import json
 import requests
 from eth_account import Account
 from web3 import Web3
@@ -5,6 +6,15 @@ from web3 import Web3
 from genrl.logging_utils.global_defs import get_logger
 
 logger = get_logger()
+
+
+def get_contract(web3: Web3, contract_address: str, abi_path: str):
+    with open(abi_path, "r") as f:
+        contract_abi = json.load(f)
+    if 'abi' not in contract_abi:
+        raise ValueError("ABI file must contain an 'abi' field.")
+    contract_abi = contract_abi['abi']
+    return web3.eth.contract(address=contract_address, abi=contract_abi)  # type: ignore
 
 
 def send_via_api(org_id, modal_proxy_url, method, args):
