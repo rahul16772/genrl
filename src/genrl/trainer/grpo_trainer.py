@@ -1,21 +1,46 @@
-import contextlib
 import gc
 import os
 from collections import defaultdict
+from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, List
 
 import torch
-import torch.utils.data
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
-from trl.data_utils import apply_chat_template
-from trl.models import create_reference_model
-from trl.trainer.grpo_config import GRPOConfig
 
 from genrl.data import DataManager
 from genrl.logging_utils.ml_logger import LoggerMixin
 from genrl.rewards import RewardManager
 from genrl.state import GameState
 from genrl.trainer import TrainerModule
+from genrl.trainer.trainer_utils import DTYPE_MAP
+
+
+
+def create_reference_model(
+    model: torch.nn.Module
+) -> torch.nn.Module:
+    ref_model = deepcopy(model)
+    for param in model.parameters():
+        param.requires_grad = False
+    return ref_model.eval()
+
+@dataclass
+class GRPOTrainerConfig:
+    epsilon: float = 0.2
+    epsilon_high: float = 0.28
+    beta: float = 0.0
+    temperature: float = 1.0
+    dtype: str = "float32"
+    enable_gradient_checkpointing: bool = True
+    max_new_tokens: int = 256
+    num_generations: int = 2
+    learning_rate: float = 1e-5
+    top_p: float = 1.0
+    top_k: int | None = None
+    min_p: float | None = None
+    repetition_penalty: float = 1.0
+    num_iterations: int = 1
 
 
 class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
@@ -24,7 +49,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     Implements the TrainerModule interface defined in base_trainer.py.
     """
 
-    def __init__(self, models: List[Any], **kwargs):
+    def __init__(self, models: List[Any], config: GRPOTrainerConfig, **kwargs):
         """
         Initialize the GRPO trainer module.
 
@@ -40,13 +65,8 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             0
         ]  # TODO(Discuss): How to settup multiple models here? Should be tethered to agent index that'll be given by gamestate. Maybe loop here and add a lil model ID datum to the gamestate?
 
-        # Configuration parameters
-        config = kwargs.get("config", None)
-        self.args = (
-            config
-            if isinstance(config, GRPOConfig)
-            else GRPOConfig(config) if config else GRPOConfig()
-        )
+        self.args = config
+
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=self.args.learning_rate
         )
@@ -58,28 +78,18 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         self.callbacks = kwargs.get("callbacks", [])
         self.save_dir = kwargs.get("log_dir", "./outputs")
         self.global_step = 0
-        self.num_generations = kwargs.get("num_generations", 2)
         assert (
-            self.num_generations > 1
-        ), f"For GRPO training, number of generations must be > 1, got {self.num_generations}"
-        self.epsilon = kwargs.get("epsilon", 0.2)
-        self.epsilon_high = kwargs.get("epsilon_high", 0.28)
-        self.beta = kwargs.get("beta", 0.0)
-        self.enable_gradient_checkpointing = kwargs.get(
-            "enable_gradient_checkpointing", True
-        )
+            self.args.num_generations > 1
+        ), f"For GRPO training, number of generations must be > 1, got {self.args.num_generations}"
+        self.dtype = DTYPE_MAP[self.args.dtype]
+        self.enable_gradient_checkpointing = self.args.enable_gradient_checkpointing
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
-            self.autocast = torch.amp.autocast(
-                device_type=self.device.type, enabled=self.args.fp16
-            )
         elif torch.backends.mps.is_available():
             self.device = torch.device("mps")
-            self.autocast = contextlib.nullcontext()
         else:
             self.device = torch.device("cpu")
-            self.autocast = contextlib.nullcontext()
 
         # Initialize core components
         self._initialize_model(self.enable_gradient_checkpointing)
@@ -90,15 +100,15 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
     def _initialize_model(self, enable_gradient_checkpointing):
         """Initialize the model and reference model."""
-        self.model = self.model.to(self.device)
+        self.model = self.model.to(device=self.device, dtype=self.dtype)
         if enable_gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
         # Reference model setup
-        if self.beta == 0.0:
+        if self.args.beta == 0.0:
             self.ref_model = None
         else:
-            self.ref_model = create_reference_model(self.model).to(self.model.device)
+            self.ref_model = create_reference_model(self.model).to(device=self.device, dtype=self.dtype)
 
     def _initialize_tokenizers(self):
         """Initialize tokenizers for the model and reward models."""
@@ -115,7 +125,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def _initialize_generation_config(self):
         # Set generation config
         self.generation_config = GenerationConfig(
-            max_new_tokens=self.args.max_completion_length,
+            max_new_tokens=self.args.max_new_tokens,
             do_sample=True,
             pad_token_id=self.processing_class.pad_token_id,
             bos_token_id=self.processing_class.bos_token_id,
@@ -139,13 +149,13 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             if for_training:
                 templated_prompts = []
                 for item in inputs:
-                    for _ in range(self.num_generations):
+                    for _ in range(self.args.num_generations):
                         templated_prompts.append(
-                            apply_chat_template(item, self.processing_class)["prompt"]
+                            self.processing_class.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True)
                         )
             else:
                 templated_prompts = [
-                    apply_chat_template(item, self.processing_class)["prompt"]
+                    self.processing_class.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True)
                     for item in inputs
                 ]
 
@@ -182,11 +192,11 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             [],
             [],
         )  # TODO: Revisit this for getting a larger number of completions. Super hacky and ugly currently.
-        for _ in range(self.num_generations):
+        for _ in range(self.args.num_generations):
             with torch.no_grad():
                 outputs = self.model.generate(
                     input_tokens.input_ids.to(self.model.device),
-                    attention_mask=input_tokens.attention_mask.to(self.model.device),
+                    attention_mask=input_tokens.attention_mask.to(self.model.device, dtype=self.dtype),
                     generation_config=self.generation_config,
                 )
 
@@ -224,7 +234,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         Returns:
             The per-token log probabilities.
         """
-        model = model.to(input_ids.device)  # this shouldn't be needed
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(
             input_ids=input_ids,
@@ -236,7 +245,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         ]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
 
         loss_mask = (
-            attention_mask[:, -logits_to_keep:].to(dtype=logits.dtype).contiguous()
+            attention_mask[:, -logits_to_keep:].to(device=logits.device, dtype=logits.dtype).contiguous()
         )
         labels = input_ids[:, -logits_to_keep:].contiguous()
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
@@ -256,7 +265,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         return token_log_probs  # compute logprobs for the input tokens
 
     def compute_loss(
-        self, model, inputs, num_items_in_batch=1, mode="train", return_metrics=False
+        self, model, inputs, mode="train", return_metrics=False
     ):
         """Compute the GRPO loss.
 
@@ -279,7 +288,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         # Concatenate prompt and completion
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1).to(self.model.device)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(
-            self.model.device
+            self.model.device, dtype=self.dtype
         )
         logits_to_keep = completion_ids.size(
             1
@@ -291,7 +300,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         )
 
         # Compute KL divergence between model and reference model if beta > 0
-        if self.beta != 0.0:
+        if self.args.beta != 0.0:
             if self.ref_model is not None:
                 ref_per_token_logps = self._get_per_token_logps(
                     self.ref_model, input_ids, attention_mask, logits_to_keep
@@ -318,8 +327,8 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         coef_2 = torch.clamp(
             coef_1,
-            1 - self.epsilon,
-            1 + self.epsilon_high if self.epsilon_high is not None else self.epsilon,
+            1 - self.args.epsilon,
+            1 + self.args.epsilon_high if self.args.epsilon_high is not None else self.args.epsilon,
         )
         advantages = advantages.unsqueeze(dim=-1)
 
@@ -328,13 +337,13 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
         # Add KL penalty if beta > 0
-        if self.beta != 0.0:
-            per_token_loss = per_token_loss + self.beta * per_token_kl
+        if self.args.beta != 0.0:
+            per_token_loss = per_token_loss + self.args.beta * per_token_kl
 
         # Final loss calculation
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
-        if self.beta != 0.0:
+        if self.args.beta != 0.0:
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
             self._metrics[mode]["kl"].append(mean_kl.item())
 
@@ -346,7 +355,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         # return for tensorboard
         metrics = {
             "loss": loss.item(),
-            "kl": mean_kl.item() if self.beta != 0.0 else None,
+            "kl": mean_kl.item() if self.args.beta != 0.0 else None,
             "clip_ratio": clip_ratio.item(),
         }
 
@@ -406,14 +415,14 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         processed_inputs = self._process_inputs(stage_inputs, for_training=True)
         model_inputs["prompt_ids"], model_inputs["prompt_mask"] = (
             processed_inputs.input_ids.to(self.model.device),
-            processed_inputs.attention_mask.to(self.model.device),
+            processed_inputs.attention_mask.to(self.model.device, dtype=self.dtype),
         )
         processed_outputs = self._process_inputs(
             stage_outputs, with_template=False, for_training=True
         )
         model_inputs["completion_ids"], model_inputs["completion_mask"] = (
             processed_outputs.input_ids.to(self.model.device),
-            processed_outputs.attention_mask.to(self.model.device),
+            processed_outputs.attention_mask.to(self.model.device, dtype=self.dtype),
         )
 
         rewards = reward_manager[stage]
@@ -428,13 +437,12 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             advantages = rewards - rewards.mean(dim=1, keepdim=True)
             if rewards.shape[1] > 1:
                 advantages /= rewards.std(dim=1, keepdim=True) + 1e-8
-        advantages = torch.flatten(advantages).to(self.model.device)
+        advantages = torch.flatten(advantages).to(self.model.device, dtype=self.dtype)
 
         model_inputs["advantages"] = advantages.squeeze(dim=-1)
         model_inputs["old_per_token_logps"] = None
 
-        with self.autocast:
-            loss = self.compute_loss(self.model, model_inputs)
+        loss = self.compute_loss(self.model, model_inputs)
 
         loss.backward()
         self.optimizer.step()

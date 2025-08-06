@@ -29,8 +29,9 @@ game_manager:
     models:
       - _target_: transformers.AutoModelForCausalLM.from_pretrained
         pretrained_model_name_or_path: Gensyn/Qwen2.5-0.5B-Instruct
-        config: trl.trainer.GRPOConfig
-    num_generations: 2
+    config:
+      _target_: genrl.trainer.grpo_trainer.GRPOTrainerConfig
+      num_generations: 2
     log_with: tensorboard
   data_manager:
     _target_: genrl.examples.multistage_math.data.MSMDataManager

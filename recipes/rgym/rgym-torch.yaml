@@ -29,11 +29,12 @@ game_manager:
     models:
       - _target_: transformers.AutoModelForCausalLM.from_pretrained
         pretrained_model_name_or_path: Gensyn/Qwen2.5-0.5B-Instruct
-        config: trl.trainer.GRPOConfig
-    epsilon: 0.2
-    epsilon_high: 0.28
-    beta: 0.0
-    num_generations: ${training.num_generations}
+    config:
+      _target_: genrl.trainer.grpo_trainer.GRPOTrainerConfig
+      epsilon: 0.2
+      epsilon_high: 0.28
+      beta: 0.0
+      num_generations: ${training.num_generations}
     log_with: tensorboard
     log_dir: ${log_dir}
   data_manager:
