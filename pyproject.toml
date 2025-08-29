@@ -20,6 +20,7 @@ dependencies = [
     "hydra-core",
     "datasets",
     "transformers==4.51.3",
+    "accelerate",
     "vllm==0.7.3",
     "bitsandbytes",  
     "tensorboard",
