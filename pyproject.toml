@@ -21,7 +21,7 @@ dependencies = [
     "datasets",
     "transformers==4.51.3",
     "vllm==0.7.3",
-    "bisandbytes",
+    "bitsandbytes",  
     "tensorboard",
     "wandb",
     "requests",
@@ -38,7 +38,9 @@ dev = [
     "pytest",
 ]
 
-examples = ["trl", 
-            "diffusers",
-            "peft", 
-            "reasoning-gym>=0.1.20"]
+examples = [
+    "trl",
+    "diffusers",
+    "peft",
+    "reasoning-gym>=0.1.20"
+]
