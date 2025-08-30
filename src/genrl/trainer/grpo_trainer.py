@@ -1,3 +1,9 @@
+try:
+    import unsloth
+except ImportError:
+    pass
+# ---------------------
+
 import gc
 import os
 from collections import defaultdict
@@ -8,7 +14,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-# --- ADDED: Optional dependencies for vLLM, bitsandbytes, and Unsloth ---
+# --- Optional dependencies for vLLM, bitsandbytes, and Unsloth ---
 try:
     from vllm import LLM, SamplingParams
     _VLLM_AVAILABLE = True
@@ -88,13 +94,13 @@ class GRPOTrainerConfig:
         "use_gradient_checkpointing": True,
     })
 
-   
+    # --- ADDED: vLLM Config (Unchanged) ---
     vllm: Dict[str, Any] = field(default_factory=lambda: {
         "gpu_memory_utilization": 0.9,
         "tensor_parallel_size": 1
     })
 
-   
+    # --- ADDED: BitsAndBytes Config (Unchanged) ---
     bitsandbytes: Dict[str, Any] = field(default_factory=lambda: {
         "load_in_4bit": True,
         "load_in_8bit": False,
@@ -548,7 +554,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         torch.save(
             {
                 "metrics": self._metrics,
-                "total_train_tokens": self._total_train_tokens,
+                "total_train_tokens": self.total_train_tokens,
                 "generation_config": self.generation_config,
             },
             os.path.join(save_dir, "trainer_state.pt"),
