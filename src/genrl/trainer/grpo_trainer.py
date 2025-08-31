@@ -6,6 +6,7 @@ except ImportError:
     unsloth, FastLanguageModel = None, None
     _UNSLOTH_AVAILABLE = False
 
+
 import gc
 import os
 from collections import defaultdict
@@ -16,7 +17,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-# --- All other optional dependencies follow Unsloth ---
+# --- Optional dependencies for vLLM, bitsandbytes, and Unsloth ---
 try:
     from vllm import LLM, SamplingParams
     _VLLM_AVAILABLE = True
@@ -31,6 +32,14 @@ try:
 except Exception:
     BitsAndBytesConfig, bnb = None, None
     _BNB_AVAILABLE = False
+
+try:
+    from unsloth import FastLanguageModel
+    _UNSLOTH_AVAILABLE = True
+except Exception:
+    FastLanguageModel = None
+    _UNSLOTH_AVAILABLE = False
+
 
 from genrl.data import DataManager
 from genrl.logging_utils.ml_logger import LoggerMixin
@@ -147,12 +156,12 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             self.device = torch.device("cpu")
 
         # --- MODIFIED: Initialization order is now critical ---
+        self._initialize_vllm_if_enabled()
         self._initialize_model()
         self._initialize_tokenizers() # Must be after model init to get path
         self._initialize_optimizer()   # Must be after model is fully loaded/adapted
         self._initialize_metrics()
         self._initialize_generation_config()
-        self._initialize_vllm_if_enabled()
         self.init_tracker(self.save_dir, log_with=kwargs.get("log_with", None))
 
     def _initialize_model(self):
@@ -235,7 +244,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 self.model.parameters(), lr=self.args.learning_rate, weight_decay=weight_decay
             )
     
-    # --- The rest of your file remains unchanged, with minor adjustments for compatibility ---
     def _initialize_vllm_if_enabled(self):
         self.vllm_engine = None
         if not self.args.use_vllm:
@@ -243,18 +251,21 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         if not _VLLM_AVAILABLE:
             raise ImportError("`use_vllm=True` but vLLM isn't installed.")
         
-        # Get base model name, even if using PEFT
-        if self.args.use_unsloth and hasattr(self.model, 'peft_config'):
-            model_name = self.model.peft_config['default'].base_model_name_or_path
-        else:
-            model_name = self.model.config._name_or_path
-
+        # Use the name from the initial model config, before any patching
+        model_name = self.model.config._name_or_path
         vllm_config = self.args.vllm
+        
+        gpu_memory_utilization = vllm_config.get("gpu_memory_utilization", 0.9)
+        # Automatically adjust memory for hybrid mode
+        if self.args.use_unsloth or self.args.use_bitsandbytes:
+            print("INFO: Hybrid mode detected. Reducing vLLM memory utilization to 0.6 to avoid OOM.")
+            gpu_memory_utilization = 0.6
+
         self.vllm_engine = LLM(
             model=model_name,
             trust_remote_code=True,
-            tensor_parallel_size=vllm_config["tensor_parallel_size"],
-            gpu_memory_utilization=vllm_config["gpu_memory_utilization"],
+            tensor_parallel_size=vllm_config.get("tensor_parallel_size", 1),
+            gpu_memory_utilization=gpu_memory_utilization,
             dtype=self.args.dtype,
         )
 
@@ -345,7 +356,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         rollout, rollout_ids = ([],[],)
         for _ in range(self.args.num_generations):
             with torch.no_grad():
-                # Use the peft model for generation if available
                 model_to_generate_with = self.model
                 outputs = model_to_generate_with.generate(
                     input_ids=input_tokens.input_ids.to(self.device),
@@ -537,7 +547,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     
     def save(self, save_dir: str) -> None:
         os.makedirs(save_dir, exist_ok=True)
-        # Handle saving PEFT adapters correctly if using Unsloth
         if self.args.use_unsloth:
             self.model.save_pretrained(save_dir)
         else:
