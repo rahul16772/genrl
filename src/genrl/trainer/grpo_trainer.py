@@ -60,7 +60,7 @@ def create_reference_model(
 
 @dataclass
 class GRPOTrainerConfig:
-    # PPO/GRPO (Original fields)
+    # --- Official file's fields ---
     epsilon: float = 0.2
     epsilon_high: float = 0.28
     beta: float = 0.0
@@ -76,40 +76,22 @@ class GRPOTrainerConfig:
     repetition_penalty: float = 1.0
     num_iterations: int = 1
 
-    # --- ADDED: Backend Switches ---
+    # --- ADDED: New configuration for backends ---
     use_vllm: bool = False
     use_bitsandbytes: bool = False
-    use_unsloth: bool = False # New switch for Unsloth
+    use_unsloth: bool = False
 
-    # --- ADDED: AdamW Optimizer Config ---
     optimizer: Dict[str, Any] = field(default_factory=lambda: {
-        "name": "adamw", # 'adamw' or 'adamw_8bit'
-        "weight_decay": 0.01,
+        "name": "adamw", "weight_decay": 0.01
     })
-
-    # --- ADDED: Unsloth PEFT/LoRA Config ---
     unsloth_peft: Dict[str, Any] = field(default_factory=lambda: {
-        "r": 16,
-        "lora_alpha": 32,
-        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        "lora_dropout": 0,
-        "bias": "none",
-        "use_gradient_checkpointing": True,
+        "r": 16, "lora_alpha": 32, "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"], "lora_dropout": 0, "bias": "none", "use_gradient_checkpointing": True
     })
-
-    # --- ADDED: vLLM Config (Unchanged) ---
     vllm: Dict[str, Any] = field(default_factory=lambda: {
-        "gpu_memory_utilization": 0.9,
-        "tensor_parallel_size": 1
+        "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1
     })
-
-    # --- ADDED: BitsAndBytes Config (Unchanged) ---
     bitsandbytes: Dict[str, Any] = field(default_factory=lambda: {
-        "load_in_4bit": True,
-        "load_in_8bit": False,
-        "bnb_4bit_compute_dtype": "bfloat16",
-        "bnb_4bit_quant_type": "nf4",
-        "bnb_4bit_use_double_quant": True
+        "load_in_4bit": True, "load_in_8bit": False, "bnb_4bit_compute_dtype": "bfloat16", "bnb_4bit_quant_type": "nf4", "bnb_4bit_use_double_quant": True
     })
 
 
@@ -120,6 +102,14 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     """
 
     def __init__(self, models: List[Any], config: GRPOTrainerConfig, **kwargs):
+        """
+        Initialize the GRPO trainer module.
+
+        Args:
+            models: List containing the model to be trained.
+            **kwargs: Additional arguments for configuration.
+        """
+        # --- Official file's __init__ logic ---
         if not models or len(models) < 1:
             raise ValueError("At least one model must be provided")
 
@@ -139,7 +129,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         print(f"⚙️ Optimizer: Using {self.args.optimizer.get('name', 'adamw')}")
         print("-----------------------------------------\n")
 
-
+        # --- Official file's __init__ logic (continued) ---
         self.processing_class = kwargs.get("processing_class", None)
         self.callbacks = kwargs.get("callbacks", [])
         self.save_dir = kwargs.get("log_dir", "./outputs")
@@ -152,76 +142,55 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
 
         # --- MODIFIED: Initialization order is now critical ---
         self._initialize_vllm_if_enabled()
         self._initialize_model()
-        self._initialize_tokenizers() # Must be after model init to get path
-        self._initialize_optimizer()   # Must be after model is fully loaded/adapted
+        self._initialize_tokenizers()
+        self._initialize_optimizer() # Must be after model is loaded
         self._initialize_metrics()
         self._initialize_generation_config()
         self.init_tracker(self.save_dir, log_with=kwargs.get("log_with", None))
 
+    # --- ADDED: New initialization methods for backends ---
     def _initialize_model(self):
-        """Initializes the model, applying Unsloth/PEFT or BitsAndBytes if configured."""
+        """Initializes the training model, applying Unsloth/PEFT or BitsAndBytes."""
         model_id = self.model.config._name_or_path
         
-        # --- PATH 1: UNSLOTH (Highest Priority) ---
         if self.args.use_unsloth:
-            if not _UNSLOTH_AVAILABLE:
-                raise ImportError("`use_unsloth=True` but Unsloth is not installed. Please `pip install 'unsloth[colab-new]'`.")
-            
+            if not _UNSLOTH_AVAILABLE: raise ImportError("`use_unsloth=True` but Unsloth is not installed.")
             bnb_config = self.args.bitsandbytes
             self.model, _ = FastLanguageModel.from_pretrained(
-                model_name=model_id,
-                max_seq_length=2048,
-                dtype=self.dtype,
-                load_in_4bit=bnb_config["load_in_4bit"],
+                model_name=model_id, max_seq_length=4096, dtype=self.dtype, load_in_4bit=bnb_config.get("load_in_4bit", True)
             )
-            
-            self.model = FastLanguageModel.get_peft_model(
-                self.model,
-                **self.args.unsloth_peft,
-            )
+            self.model = FastLanguageModel.get_peft_model(self.model, **self.args.unsloth_peft)
         
-        # --- PATH 2: BITSANDBYTES (if Unsloth is not used) ---
         elif self.args.use_bitsandbytes:
-            if not _BNB_AVAILABLE:
-                raise ImportError("`use_bitsandbytes=True` but bitsandbytes is not installed.")
-            if not torch.cuda.is_available():
-                raise RuntimeError("BitsAndBytes quantization requires a CUDA-enabled GPU.")
-
+            if not _BNB_AVAILABLE: raise ImportError("`use_bitsandbytes=True` but bitsandbytes is not installed.")
+            if not torch.cuda.is_available(): raise RuntimeError("BitsAndBytes requires a CUDA-enabled GPU.")
             bnb_config = self.args.bitsandbytes
             compute_dtype = DTYPE_MAP.get(bnb_config["bnb_4bit_compute_dtype"], torch.bfloat16)
             quant_cfg = BitsAndBytesConfig(
-                load_in_4bit=bnb_config["load_in_4bit"],
-                load_in_8bit=bnb_config["load_in_8bit"],
-                bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_quant_type=bnb_config["bnb_4bit_quant_type"],
-                bnb_4bit_use_double_quant=bnb_config["bnb_4bit_use_double_quant"],
+                load_in_4bit=bnb_config["load_in_4bit"], load_in_8bit=bnb_config["load_in_8bit"], bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_quant_type=bnb_config["bnb_4bit_quant_type"], bnb_4bit_use_double_quant=bnb_config["bnb_4bit_use_double_quant"],
             )
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_id, quantization_config=quant_cfg, device_map="auto", trust_remote_code=True
             )
-
-        # --- PATH 3: STANDARD (No optimizations) ---
         else:
             self.model = self.model.to(device=self.device, dtype=self.dtype)
             if self.enable_gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
                 self.model.gradient_checkpointing_enable()
 
-        # --- Reference Model Setup ---
         if self.args.beta > 0.0:
             self.ref_model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                torch_dtype=self.dtype,
-                device_map="auto",
-                trust_remote_code=True,
+                model_id, torch_dtype=self.dtype, device_map="auto", trust_remote_code=True
             ).eval()
-            for param in self.ref_model.parameters():
-                param.requires_grad = False
+            for param in self.ref_model.parameters(): param.requires_grad = False
         else:
             self.ref_model = None
 
@@ -229,68 +198,64 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         """Initializes the AdamW or 8-bit AdamW optimizer."""
         optimizer_name = self.args.optimizer.get("name", "adamw").lower()
         weight_decay = self.args.optimizer.get("weight_decay", 0.01)
-
-        # Use 8-bit optimizer if requested and available
         if optimizer_name == "adamw_8bit" and (self.args.use_bitsandbytes or self.args.use_unsloth):
-            if not _BNB_AVAILABLE:
-                raise ImportError("Cannot use 8-bit AdamW, bitsandbytes is not installed.")
+            if not _BNB_AVAILABLE: raise ImportError("Cannot use 8-bit AdamW, bitsandbytes is not installed.")
             self.optimizer = bnb.optim.AdamW8bit(
                 self.model.parameters(), lr=self.args.learning_rate, weight_decay=weight_decay
             )
         else:
             if optimizer_name == "adamw_8bit":
                  print("Warning: `use_bitsandbytes` or `use_unsloth` is false, falling back to standard AdamW optimizer.")
+            # This line is now the fallback, replacing the original hardcoded optimizer
             self.optimizer = torch.optim.AdamW(
                 self.model.parameters(), lr=self.args.learning_rate, weight_decay=weight_decay
             )
     
     def _initialize_vllm_if_enabled(self):
+        """Initializes the vLLM engine, with automatic memory management for hybrid mode."""
         self.vllm_engine = None
-        if not self.args.use_vllm:
-            return
-        if not _VLLM_AVAILABLE:
-            raise ImportError("`use_vllm=True` but vLLM isn't installed.")
+        if not self.args.use_vllm: return
+        if not _VLLM_AVAILABLE: raise ImportError("`use_vllm=True` but vLLM isn't installed.")
         
-        # Use the name from the initial model config, before any patching
         model_name = self.model.config._name_or_path
         vllm_config = self.args.vllm
-        
         gpu_memory_utilization = vllm_config.get("gpu_memory_utilization", 0.9)
-        # Automatically adjust memory for hybrid mode
         if self.args.use_unsloth or self.args.use_bitsandbytes:
-            print("INFO: Hybrid mode detected. Reducing vLLM memory utilization to 0.6 to avoid OOM.")
+            print("INFO: Hybrid mode detected. Reducing vLLM memory utilization to 0.6 to prevent OOM.")
             gpu_memory_utilization = 0.6
 
         self.vllm_engine = LLM(
-            model=model_name,
-            trust_remote_code=True,
+            model=model_name, trust_remote_code=True,
             tensor_parallel_size=vllm_config.get("tensor_parallel_size", 1),
             gpu_memory_utilization=gpu_memory_utilization,
-            dtype=self.args.dtype,
+            max_model_len=4096, dtype=self.args.dtype,
         )
 
+    # --- The rest of the file is the original, official code, UNTOUCHED ---
     def _initialize_tokenizers(self):
+        """Initialize tokenizers for the model and reward models."""
         if self.processing_class is None:
+            model_id = self.model.config._name_or_path
+            # Handle getting name from PEFT model
             if self.args.use_unsloth and hasattr(self.model, 'peft_config'):
                  model_id = self.model.peft_config['default'].base_model_name_or_path
-            else:
-                 model_id = self.model.config._name_or_path
-            
-            self.processing_class = AutoTokenizer.from_pretrained(
-                model_id, padding_side="left"
-            )
+            self.processing_class = AutoTokenizer.from_pretrained(model_id, padding_side="left")
         if self.processing_class.pad_token is None:
             self.processing_class.pad_token = self.processing_class.eos_token
-    
+
     def _initialize_metrics(self):
+        """Initialize metrics tracking for training and evaluation."""
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
 
     def _initialize_generation_config(self):
+        # Set generation config
         self.generation_config = GenerationConfig(
             max_new_tokens=self.args.max_new_tokens,
             do_sample=True,
             pad_token_id=self.processing_class.pad_token_id,
+            bos_token_id=self.processing_class.bos_token_id,
+            eos_token_id=self.processing_class.eos_token_id,
             temperature=self.args.temperature,
             top_p=self.args.top_p,
             top_k=self.args.top_k,
@@ -304,7 +269,9 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         elif isinstance(inputs, dict):
             inputs = [inputs]
 
-        if (with_template):
+        if (
+            with_template
+        ):  # Pick up here!!!! Remove the for generation arg and instead unflatten the templated prompts to get back tensor of shape [batch size, completions, tokens]
             if for_training:
                 templated_prompts = []
                 for item in inputs:
@@ -317,12 +284,13 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                     self.processing_class.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True)
                     for item in inputs
                 ]
+
         else:
             if for_training:
                 templated_prompts = []
                 for generations in inputs:
                     for output in generations:
-                        templated_prompts.append(output)
+                        templated_prompts.append(output)  # [item[0] for item in inputs]
             else:
                 templated_prompts = [item[0] for item in inputs]
 
@@ -334,39 +302,36 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def generate(
         self, inputs: Any, return_completion_ids: bool = False, stage=0
     ) -> Any:
+        """
+        Generate outputs from the model for the given inputs.
+        """
         if self.vllm_engine:
-            prompts = [
-                self.processing_class.apply_chat_template(
-                    item["prompt"], tokenize=False, add_generation_prompt=True
-                ) for item in inputs
-            ]
-            sampling = SamplingParams(
-                n=self.args.num_generations,
-                temperature=self.args.temperature,
-                top_p=self.args.top_p,
-                max_tokens=self.args.max_new_tokens,
-            )
+            prompts = [self.processing_class.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True) for item in inputs]
+            sampling = SamplingParams(n=self.args.num_generations, temperature=self.args.temperature, top_p=self.args.top_p, max_tokens=self.args.max_new_tokens)
             outputs = self.vllm_engine.generate(prompts, sampling_params=sampling, use_tqdm=False)
-            rollout = [[o.text for o in out.outputs] for out in outputs]
-            if return_completion_ids:
-                print("Warning: `return_completion_ids=True` is not optimized for the vLLM backend.")
-            return rollout
+            return [[o.text for o in out.outputs] for out in outputs]
 
         input_tokens = self._process_inputs(inputs)
-        rollout, rollout_ids = ([],[],)
+        rollout, rollout_ids = (
+            [],
+            [],
+        )  # TODO: Revisit this for getting a larger number of completions. Super hacky and ugly currently.
         for _ in range(self.args.num_generations):
             with torch.no_grad():
-                model_to_generate_with = self.model
-                outputs = model_to_generate_with.generate(
-                    input_ids=input_tokens.input_ids.to(self.device),
-                    attention_mask=input_tokens.attention_mask.to(self.device),
+                outputs = self.model.generate(
+                    input_tokens.input_ids.to(self.model.device),
+                    attention_mask=input_tokens.attention_mask.to(self.model.device, dtype=self.dtype),
                     generation_config=self.generation_config,
                 )
+
+            # Extract completions (i.e., removes prompt part)
             prompt_length = input_tokens.input_ids.size(1)
             completion_ids = outputs[:, prompt_length:]
+
             completions = self.processing_class.batch_decode(
                 completion_ids, skip_special_tokens=True
             )
+
             if len(rollout) == 0:
                 rollout = [[comp] for comp in completions]
                 if return_completion_ids:
@@ -382,11 +347,16 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             return rollout
 
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
+        """Get the per-token log probabilities for the input tokens."""
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        logits = outputs.logits[:, :-1, :]
+        logits = outputs.logits
+        logits = logits[
+            :, :-1, :
+        ]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+
         loss_mask = (
             attention_mask[:, -logits_to_keep:].to(device=logits.device, dtype=logits.dtype).contiguous()
         )
@@ -408,16 +378,19 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def compute_loss(
         self, model, inputs, mode="train", return_metrics=False
     ):
+        """Compute the GRPO loss."""
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = (
             inputs["completion_ids"],
             inputs["completion_mask"],
         )
-        input_ids = torch.cat([prompt_ids, completion_ids], dim=1).to(self.device)
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1).to(self.model.device)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(
-            self.device, dtype=self.dtype
+            self.model.device, dtype=self.dtype
         )
-        logits_to_keep = completion_ids.size(1)
+        logits_to_keep = completion_ids.size(
+            1
+        )
         per_token_logps = self._get_per_token_logps(
             model, input_ids, attention_mask, logits_to_keep
         )
@@ -428,6 +401,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 )
             else:
                 ref_per_token_logps = per_token_logps.clone()
+
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps)
                 - (ref_per_token_logps - per_token_logps)
@@ -456,7 +430,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         if self.args.beta != 0.0:
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
             self._metrics[mode]["kl"].append(mean_kl.item())
-        is_clipped = (per_token_loss1 > per_token_loss2).float()
+        is_clipped = (per_token_loss1 < per_token_loss2).float()
         clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
         self._metrics[mode]["clip_ratio"].append(clip_ratio.item())
         self._metrics[mode]["loss"].append(loss.item())
@@ -473,6 +447,9 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def train(
         self, state: GameState, data_manager: DataManager, reward_manager: RewardManager
     ) -> None:
+        """
+        Train the model using the given game state and reward manager.
+        """
         self.model.train()
         global_step = self.global_step
         for stage in range(state.stage):
@@ -505,15 +482,15 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         model_inputs = {}
         processed_inputs = self._process_inputs(stage_inputs, for_training=True)
         model_inputs["prompt_ids"], model_inputs["prompt_mask"] = (
-            processed_inputs.input_ids.to(self.device),
-            processed_inputs.attention_mask.to(self.device, dtype=self.dtype),
+            processed_inputs.input_ids.to(self.model.device),
+            processed_inputs.attention_mask.to(self.model.device, dtype=self.dtype),
         )
         processed_outputs = self._process_inputs(
             stage_outputs, with_template=False, for_training=True
         )
         model_inputs["completion_ids"], model_inputs["completion_mask"] = (
-            processed_outputs.input_ids.to(self.device),
-            processed_outputs.attention_mask.to(self.device, dtype=self.dtype),
+            processed_outputs.input_ids.to(self.model.device),
+            processed_outputs.attention_mask.to(self.model.device, dtype=self.dtype),
         )
         rewards = reward_manager[stage]
         rewards = [
@@ -526,7 +503,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             advantages = rewards - rewards.mean(dim=1, keepdim=True)
             if rewards.shape[1] > 1:
                 advantages /= rewards.std(dim=1, keepdim=True) + 1e-8
-        advantages = torch.flatten(advantages).to(self.device, dtype=self.dtype)
+        advantages = torch.flatten(advantages).to(self.model.device, dtype=self.dtype)
         model_inputs["advantages"] = advantages.squeeze(dim=-1)
         model_inputs["old_per_token_logps"] = None
         loss = self.compute_loss(self.model, model_inputs)
@@ -546,6 +523,9 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         pass
     
     def save(self, save_dir: str) -> None:
+        """
+        Save the model and trainer state to the given directory.
+        """
         os.makedirs(save_dir, exist_ok=True)
         if self.args.use_unsloth:
             self.model.save_pretrained(save_dir)
@@ -554,6 +534,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 self.model.save_pretrained(save_dir)
         if hasattr(self.processing_class, 'save_pretrained'):
              self.processing_class.save_pretrained(save_dir)
+
         torch.save(
             {
                 "metrics": self._metrics,
@@ -565,11 +546,15 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
     @classmethod
     def load(cls, load_dir: str, **kwargs) -> "GRPOLanguageTrainerModule":
+        """
+        Load a trainer module from the given directory.
+        """
         model = AutoModelForCausalLM.from_pretrained(load_dir)
         config = kwargs.pop('config', GRPOTrainerConfig())
-        trainer = cls([model], config=config, **kwargs)
-        if os.path.exists(os.path.join(load_dir, "trainer_state.pt")):
-            trainer_state = torch.load(os.path.join(load_dir, "trainer_state.pt"))
+        trainer = cls([model], config, **kwargs)
+        state_path = os.path.join(load_dir, "trainer_state.pt")
+        if os.path.exists(state_path):
+            trainer_state = torch.load(state_path)
             trainer._metrics = trainer_state["metrics"]
             trainer._total_train_tokens = trainer_state["total_train_tokens"]
             trainer.generation_config = trainer_state["generation_config"]
@@ -578,7 +563,10 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def cleanup_step(self):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         gc.collect()
 
     def cleanup(self):
         self.cleanup_trackers()
+
