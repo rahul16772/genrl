@@ -1,8 +1,10 @@
 try:
     import unsloth
+    from unsloth import FastLanguageModel
+    _UNSLOTH_AVAILABLE = True
 except ImportError:
-    pass
-# ---------------------
+    unsloth, FastLanguageModel = None, None
+    _UNSLOTH_AVAILABLE = False
 
 import gc
 import os
@@ -14,7 +16,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-# --- Optional dependencies for vLLM, bitsandbytes, and Unsloth ---
+# --- All other optional dependencies follow Unsloth ---
 try:
     from vllm import LLM, SamplingParams
     _VLLM_AVAILABLE = True
@@ -29,14 +31,6 @@ try:
 except Exception:
     BitsAndBytesConfig, bnb = None, None
     _BNB_AVAILABLE = False
-
-try:
-    from unsloth import FastLanguageModel
-    _UNSLOTH_AVAILABLE = True
-except Exception:
-    FastLanguageModel = None
-    _UNSLOTH_AVAILABLE = False
-
 
 from genrl.data import DataManager
 from genrl.logging_utils.ml_logger import LoggerMixin
@@ -554,7 +548,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         torch.save(
             {
                 "metrics": self._metrics,
-                "total_train_tokens": self.total_train_tokens,
+                "total_train_tokens": self._total_train_tokens,
                 "generation_config": self.generation_config,
             },
             os.path.join(save_dir, "trainer_state.pt"),
