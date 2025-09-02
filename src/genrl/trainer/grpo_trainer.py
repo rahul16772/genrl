@@ -188,7 +188,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         model_name = self.model.config._name_or_path
         vllm_config = self.args.vllm
         
-        gpu_memory_utilization = vllm_config.get("gpu_memory_utilization", 0.9)
+        gpu_memory_utilization = vllm_config.get("gpu_memory_utilization", 0.85)
         if self.args.use_bitsandbytes:
             print("INFO: Hybrid mode detected. Automatically reducing vLLM memory utilization to prevent OOM.")
             gpu_memory_utilization = 0.6
