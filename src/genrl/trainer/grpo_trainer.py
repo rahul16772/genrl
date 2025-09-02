@@ -1,5 +1,3 @@
-# --- Unsloth import is removed as requested ---
-
 import gc
 import os
 from collections import defaultdict
@@ -10,7 +8,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-# --- ADDED: Optional dependencies for vLLM and bitsandbytes ---
+# --- Optional dependencies ---
 try:
     from vllm import LLM, SamplingParams
     _VLLM_AVAILABLE = True
@@ -25,7 +23,6 @@ try:
 except Exception:
     BitsAndBytesConfig, bnb = None, None
     _BNB_AVAILABLE = False
-
 
 from genrl.data import DataManager
 from genrl.logging_utils.ml_logger import LoggerMixin
@@ -46,7 +43,7 @@ def create_reference_model(
 
 @dataclass
 class GRPOTrainerConfig:
-    # --- Official file's fields ---
+    # Official fields
     epsilon: float = 0.2
     epsilon_high: float = 0.28
     beta: float = 0.0
@@ -62,16 +59,21 @@ class GRPOTrainerConfig:
     repetition_penalty: float = 1.0
     num_iterations: int = 1
 
-    # --- ADDED: New configuration for backends ---
+    # --- Backend Switches (Unsloth removed) ---
     use_vllm: bool = False
     use_bitsandbytes: bool = False
 
+    # --- AdamW Optimizer Config ---
     optimizer: Dict[str, Any] = field(default_factory=lambda: {
         "name": "adamw", "weight_decay": 0.01
     })
+
+    # --- vLLM Config ---
     vllm: Dict[str, Any] = field(default_factory=lambda: {
         "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1
     })
+
+    # --- BitsAndBytes Config ---
     bitsandbytes: Dict[str, Any] = field(default_factory=lambda: {
         "load_in_4bit": True, "load_in_8bit": False, "bnb_4bit_compute_dtype": "bfloat16", "bnb_4bit_quant_type": "nf4", "bnb_4bit_use_double_quant": True
     })
@@ -91,14 +93,17 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             models: List containing the model to be trained.
             **kwargs: Additional arguments for configuration.
         """
-        # --- Official file's __init__ logic ---
+        # Extract model and reward functions
         if not models or len(models) < 1:
             raise ValueError("At least one model must be provided")
 
-        self.model = models[0]
+        self.model = models[
+            0
+        ]  # TODO(Discuss): How to settup multiple models here? Should be tethered to agent index that'll be given by gamestate. Maybe loop here and add a lil model ID datum to the gamestate?
+
         self.args = config
 
-        # --- ADDED: Status message for backend configuration ---
+        # --- Status message for backend configuration (Unsloth removed) ---
         print("\n--- GRPO Trainer Backend Configuration ---")
         if self.args.use_vllm:
             print("⚡️ vLLM Engine: Enabled for fast generation.")
@@ -109,8 +114,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         print(f"⚙️ Optimizer: Using {self.args.optimizer.get('name', 'adamw')}")
         print("-----------------------------------------\n")
 
-        # --- MODIFIED: The original optimizer line is replaced by the _initialize_optimizer method call below ---
-        
+
         self.processing_class = kwargs.get("processing_class", None)
         self.callbacks = kwargs.get("callbacks", [])
         self.save_dir = kwargs.get("log_dir", "./outputs")
@@ -128,16 +132,15 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         else:
             self.device = torch.device("cpu")
 
-        # --- MODIFIED: Initialization order adjusted to support new features ---
-        self._initialize_model() # This now handles bitsandbytes
+        # --- Initialization order restored to normal ---
+        self._initialize_model()
         self._initialize_tokenizers()
-        self._initialize_optimizer() # Must be after model is loaded
+        self._initialize_optimizer()
         self._initialize_metrics()
         self._initialize_generation_config()
         self._initialize_vllm_if_enabled()
         self.init_tracker(self.save_dir, log_with=kwargs.get("log_with", None))
 
-    # --- MODIFIED: This method is replaced with a more advanced version that handles bitsandbytes ---
     def _initialize_model(self):
         """Initializes the training model, applying BitsAndBytes if configured."""
         model_id = self.model.config._name_or_path
@@ -155,6 +158,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 model_id, quantization_config=quant_cfg, device_map="auto", trust_remote_code=True
             )
         else:
+            # This is now the default path, matching the original file's logic
             self.model = self.model.to(device=self.device, dtype=self.dtype)
             if self.enable_gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
                 self.model.gradient_checkpointing_enable()
@@ -164,7 +168,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         else:
             self.ref_model = None
 
-    # --- ADDED: New methods to handle backend initialization ---
     def _initialize_optimizer(self):
         optimizer_name = self.args.optimizer.get("name", "adamw").lower()
         weight_decay = self.args.optimizer.get("weight_decay", 0.01)
@@ -173,13 +176,15 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             self.optimizer = bnb.optim.AdamW8bit(self.model.parameters(), lr=self.args.learning_rate, weight_decay=weight_decay)
         else:
             if optimizer_name == "adamw_8bit":
-                 print("Warning: `use_bitsandbytes` is false, falling back to standard AdamW optimizer.")
+                 print("Warning: `use_bitsandbytes` is false, falling back to standard Adam optimizer.")
+            # Default to the original optimizer logic
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
-
+    
     def _initialize_vllm_if_enabled(self):
         self.vllm_engine = None
         if not self.args.use_vllm: return
         if not _VLLM_AVAILABLE: raise ImportError("`use_vllm=True` but vLLM isn't installed.")
+        
         model_name = self.model.config._name_or_path
         vllm_config = self.args.vllm
         
@@ -195,13 +200,14 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             max_model_len=4096, dtype=self.args.dtype,
         )
 
-    # --- The rest of the file is your official version, UNTOUCHED ---
     def _initialize_tokenizers(self):
         """Initialize tokenizers for the model and reward models."""
         if self.processing_class is None:
             self.processing_class = AutoTokenizer.from_pretrained(
                 self.model.config._name_or_path, padding_side="left"
             )
+        if self.processing_class.pad_token is None:
+            self.processing_class.pad_token = self.processing_class.eos_token
 
     def _initialize_metrics(self):
         """Initialize metrics tracking for training and evaluation."""
@@ -540,3 +546,4 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
     def cleanup(self):
         self.cleanup_trackers()
+
