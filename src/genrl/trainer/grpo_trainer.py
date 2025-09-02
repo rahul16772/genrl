@@ -70,7 +70,7 @@ class GRPOTrainerConfig:
 
     # --- vLLM Config ---
     vllm: Dict[str, Any] = field(default_factory=lambda: {
-        "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1
+        "gpu_memory_utilization": 0.85, "tensor_parallel_size": 1
     })
 
     # --- BitsAndBytes Config ---
@@ -93,14 +93,11 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             models: List containing the model to be trained.
             **kwargs: Additional arguments for configuration.
         """
-        # Extract model and reward functions
+        # --- Official file's __init__ logic ---
         if not models or len(models) < 1:
             raise ValueError("At least one model must be provided")
 
-        self.model = models[
-            0
-        ]  # TODO(Discuss): How to settup multiple models here? Should be tethered to agent index that'll be given by gamestate. Maybe loop here and add a lil model ID datum to the gamestate?
-
+        self.model = models[0]
         self.args = config
 
         # --- Status message for backend configuration (Unsloth removed) ---
@@ -127,8 +124,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
 
