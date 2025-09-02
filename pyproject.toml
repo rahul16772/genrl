@@ -21,7 +21,6 @@ dependencies = [
     "datasets",
     "transformers==4.51.3",
     "accelerate",
-    "unsloth[colab-new]", 
     "vllm==0.7.3",
     "bitsandbytes",  
     "tensorboard",
