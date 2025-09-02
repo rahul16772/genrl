@@ -1,12 +1,3 @@
-try:
-    import unsloth
-    from unsloth import FastLanguageModel
-    _UNSLOTH_AVAILABLE = True
-except ImportError:
-    unsloth, FastLanguageModel = None, None
-    _UNSLOTH_AVAILABLE = False
-
-
 import gc
 import os
 from collections import defaultdict
@@ -32,13 +23,6 @@ try:
 except Exception:
     BitsAndBytesConfig, bnb = None, None
     _BNB_AVAILABLE = False
-
-try:
-    from unsloth import FastLanguageModel
-    _UNSLOTH_AVAILABLE = True
-except Exception:
-    FastLanguageModel = None
-    _UNSLOTH_AVAILABLE = False
 
 
 from genrl.data import DataManager
@@ -79,7 +63,7 @@ class GRPOTrainerConfig:
     # --- ADDED: New configuration for backends ---
     use_vllm: bool = False
     use_bitsandbytes: bool = False
-    use_unsloth: bool = False
+   
 
     optimizer: Dict[str, Any] = field(default_factory=lambda: {
         "name": "adamw", "weight_decay": 0.01
@@ -88,7 +72,7 @@ class GRPOTrainerConfig:
         "r": 16, "lora_alpha": 32, "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"], "lora_dropout": 0, "bias": "none", "use_gradient_checkpointing": True
     })
     vllm: Dict[str, Any] = field(default_factory=lambda: {
-        "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1
+        "gpu_memory_utilization": 0.85, "tensor_parallel_size": 1
     })
     bitsandbytes: Dict[str, Any] = field(default_factory=lambda: {
         "load_in_4bit": True, "load_in_8bit": False, "bnb_4bit_compute_dtype": "bfloat16", "bnb_4bit_quant_type": "nf4", "bnb_4bit_use_double_quant": True
@@ -118,8 +102,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
         # --- ADDED: Status message for backend configuration ---
         print("\n--- GRPO Trainer Backend Configuration ---")
-        if self.args.use_unsloth:
-             print("🚀 Unsloth: Enabled for fast PEFT training.")
         if self.args.use_vllm:
             print("⚡️ vLLM Engine: Enabled for fast generation.")
         if self.args.use_bitsandbytes and not self.args.use_unsloth:
@@ -220,9 +202,9 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         model_name = self.model.config._name_or_path
         vllm_config = self.args.vllm
         gpu_memory_utilization = vllm_config.get("gpu_memory_utilization", 0.9)
-        if self.args.use_unsloth or self.args.use_bitsandbytes:
+        if self.args.use_bitsandbytes:
             print("INFO: Hybrid mode detected. Reducing vLLM memory utilization to 0.6 to prevent OOM.")
-            gpu_memory_utilization = 0.6
+            gpu_memory_utilization = 0.85
 
         self.vllm_engine = LLM(
             model=model_name, trust_remote_code=True,
