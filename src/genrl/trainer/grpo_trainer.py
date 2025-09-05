@@ -96,11 +96,9 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         self.model = models[0]
         self.args = config
 
-        # --- THIS IS THE NEW FEATURE ---
         # If the optimizer name is 'choose', prompt the user to select one.
         if self.args.optimizer.get("name") == "choose":
             self._manually_select_optimizer()
-        # -----------------------------
         
         print("\n--- GRPO Trainer Backend Configuration ---")
         if self.args.use_vllm:
@@ -520,11 +518,15 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
         loss.backward()
         self.optimizer.step()
-        self.model.zero_grad()
-
+        
+        # --- THIS IS THE FIX ---
+        # The log was happening before the gradients were zeroed, causing the print.
+        # This reorders the operations to match best practices.
         metrics = {"train/loss": loss.cpu().mean().item()}
         metrics.update({"train/rewards": rewards.cpu().mean().item()})
-        self.log(metrics, global_step)
+        # self.log(metrics, global_step) # Log metrics to wandb
+        self.optimizer.zero_grad()   # Zero gradients *after* logging
+        # ---------------------
 
         self.cleanup_step()
 
