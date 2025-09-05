@@ -17,11 +17,12 @@ except Exception:
     _VLLM_AVAILABLE = False
 
 try:
-    from transformers import BitsAndBytesConfig
+    # ADDED: Adafactor for the new optimizer option
+    from transformers import BitsAndBytesConfig, Adafactor
     import bitsandbytes as bnb
     _BNB_AVAILABLE = True
 except Exception:
-    BitsAndBytesConfig, bnb = None, None
+    BitsAndBytesConfig, bnb, Adafactor = None, None, None
     _BNB_AVAILABLE = False
 
 from genrl.data import DataManager
@@ -59,18 +60,18 @@ class GRPOTrainerConfig:
     repetition_penalty: float = 1.0
     num_iterations: int = 1
 
-    # --- Backend Switches (Unsloth removed) ---
+    # --- Backend Switches ---
     use_vllm: bool = False
     use_bitsandbytes: bool = False
 
-    # --- AdamW Optimizer Config ---
+    # --- Optimizer Config ---
     optimizer: Dict[str, Any] = field(default_factory=lambda: {
         "name": "adamw", "weight_decay": 0.01
     })
 
     # --- vLLM Config ---
     vllm: Dict[str, Any] = field(default_factory=lambda: {
-        "gpu_memory_utilization": 0.85, "tensor_parallel_size": 1
+        "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1
     })
 
     # --- BitsAndBytes Config ---
@@ -88,19 +89,19 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def __init__(self, models: List[Any], config: GRPOTrainerConfig, **kwargs):
         """
         Initialize the GRPO trainer module.
-
-        Args:
-            models: List containing the model to be trained.
-            **kwargs: Additional arguments for configuration.
         """
-        # --- Official file's __init__ logic ---
         if not models or len(models) < 1:
             raise ValueError("At least one model must be provided")
 
         self.model = models[0]
         self.args = config
 
-        # --- Status message for backend configuration (Unsloth removed) ---
+        # --- THIS IS THE NEW FEATURE ---
+        # If the optimizer name is 'choose', prompt the user to select one.
+        if self.args.optimizer.get("name") == "choose":
+            self._manually_select_optimizer()
+        # -----------------------------
+        
         print("\n--- GRPO Trainer Backend Configuration ---")
         if self.args.use_vllm:
             print("⚡️ vLLM Engine: Enabled for fast generation.")
@@ -111,14 +112,11 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         print(f"⚙️ Optimizer: Using {self.args.optimizer.get('name', 'adamw')}")
         print("-----------------------------------------\n")
 
-
         self.processing_class = kwargs.get("processing_class", None)
         self.callbacks = kwargs.get("callbacks", [])
         self.save_dir = kwargs.get("log_dir", "./outputs")
         self.global_step = 0
-        assert (
-            self.args.num_generations > 1
-        ), f"For GRPO training, number of generations must be > 1, got {self.args.num_generations}"
+        assert self.args.num_generations > 1, "GRPO requires num_generations > 1"
         self.dtype = DTYPE_MAP[self.args.dtype]
         self.enable_gradient_checkpointing = self.args.enable_gradient_checkpointing
 
@@ -127,7 +125,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         else:
             self.device = torch.device("cpu")
 
-        # --- Initialization order restored to normal ---
+        # MODIFIED: Initialization order adjusted for new features
         self._initialize_model()
         self._initialize_tokenizers()
         self._initialize_optimizer()
@@ -135,6 +133,33 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         self._initialize_generation_config()
         self._initialize_vllm_if_enabled()
         self.init_tracker(self.save_dir, log_with=kwargs.get("log_with", None))
+
+        print(f"✅ VERIFICATION: Optimizer object created is of type: {type(self.optimizer)}")
+
+    def _manually_select_optimizer(self):
+        """Presents a menu to the user to select an optimizer at runtime."""
+        print("\n--- Please Select an Optimizer ---")
+        print("1: AdamW (Default, Good Performance)")
+        print("2: AdamW_8bit (Best for VRAM Savings)")
+        print("3: SGD (Low VRAM, can be slower)")
+        print("4: Adafactor (Memory Efficient)")
+        
+        choice_map = {
+            "1": "adamw",
+            "2": "adamw_8bit",
+            "3": "sgd",
+            "4": "adafactor",
+        }
+        
+        while True:
+            choice = input("Enter your choice (1-4): ")
+            if choice in choice_map:
+                chosen_optimizer = choice_map[choice]
+                self.args.optimizer["name"] = chosen_optimizer
+                print(f"✅ You have selected: {chosen_optimizer}")
+                return
+            else:
+                print("❌ Invalid choice. Please enter a number between 1 and 4.")
 
     def _initialize_model(self):
         """Initializes the training model, applying BitsAndBytes if configured."""
@@ -153,7 +178,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 model_id, quantization_config=quant_cfg, device_map="auto", trust_remote_code=True
             )
         else:
-            # This is now the default path, matching the original file's logic
             self.model = self.model.to(device=self.device, dtype=self.dtype)
             if self.enable_gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
                 self.model.gradient_checkpointing_enable()
@@ -164,16 +188,32 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             self.ref_model = None
 
     def _initialize_optimizer(self):
+        """Initializes the optimizer based on the config."""
         optimizer_name = self.args.optimizer.get("name", "adamw").lower()
         weight_decay = self.args.optimizer.get("weight_decay", 0.01)
-        if optimizer_name == "adamw_8bit" and self.args.use_bitsandbytes:
-            if not _BNB_AVAILABLE: raise ImportError("Cannot use 8-bit AdamW, bitsandbytes is not installed.")
-            self.optimizer = bnb.optim.AdamW8bit(self.model.parameters(), lr=self.args.learning_rate, weight_decay=weight_decay)
-        else:
-            if optimizer_name == "adamw_8bit":
-                 print("Warning: `use_bitsandbytes` is false, falling back to standard Adam optimizer.")
-            # Default to the original optimizer logic
-            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        lr = self.args.learning_rate
+
+        match optimizer_name:
+            case "adamw_8bit":
+                if not self.args.use_bitsandbytes:
+                    print("Warning: `use_bitsandbytes` is false. Falling back to standard AdamW optimizer.")
+                    self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+                elif not _BNB_AVAILABLE:
+                    raise ImportError("Cannot use 8-bit AdamW, bitsandbytes is not installed.")
+                else:
+                    self.optimizer = bnb.optim.AdamW8bit(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+            case "adamw":
+                self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+            case "sgd":
+                self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
+            case "adafactor":
+                if Adafactor is None:
+                    raise ImportError("Cannot use Adafactor, please ensure transformers is installed correctly.")
+                self.optimizer = Adafactor(self.model.parameters(), lr=lr, weight_decay=weight_decay, scale_parameter=False, relative_step=False)
+            case _:
+                # Fallback to the original official optimizer
+                print(f"Warning: Unknown optimizer '{optimizer_name}'. Falling back to default Adam.")
+                self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
     
     def _initialize_vllm_if_enabled(self):
         self.vllm_engine = None
@@ -183,10 +223,10 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         model_name = self.model.config._name_or_path
         vllm_config = self.args.vllm
         
-        gpu_memory_utilization = vllm_config.get("gpu_memory_utilization", 0.85)
+        gpu_memory_utilization = vllm_config.get("gpu_memory_utilization", 0.9)
         if self.args.use_bitsandbytes:
             print("INFO: Hybrid mode detected. Automatically reducing vLLM memory utilization to prevent OOM.")
-            gpu_memory_utilization = 0.6
+            gpu_memory_utilization = 0.5
 
         self.vllm_engine = LLM(
             model=model_name, trust_remote_code=True,
@@ -195,6 +235,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             max_model_len=4096, dtype=self.args.dtype,
         )
 
+    # --- The rest of the file is your official version, UNTOUCHED ---
     def _initialize_tokenizers(self):
         """Initialize tokenizers for the model and reward models."""
         if self.processing_class is None:
@@ -523,7 +564,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         """
         model = AutoModelForCausalLM.from_pretrained(load_dir)
         config = kwargs.pop('config', GRPOTrainerConfig())
-        trainer = cls([model], config, **kwargs)
+        trainer = cls([model], config=config, **kwargs)
         state_path = os.path.join(load_dir, "trainer_state.pt")
         if os.path.exists(state_path):
             trainer_state = torch.load(state_path)
