@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-# --- Optional dependencies ---
+# --- ADDED: Optional dependencies for backends ---
 try:
     from vllm import LLM, SamplingParams
     _VLLM_AVAILABLE = True
@@ -17,13 +17,13 @@ except Exception:
     _VLLM_AVAILABLE = False
 
 try:
-    # ADDED: Adafactor for the new optimizer option
     from transformers import BitsAndBytesConfig, Adafactor
     import bitsandbytes as bnb
     _BNB_AVAILABLE = True
 except Exception:
     BitsAndBytesConfig, bnb, Adafactor = None, None, None
     _BNB_AVAILABLE = False
+
 
 from genrl.data import DataManager
 from genrl.logging_utils.ml_logger import LoggerMixin
@@ -44,7 +44,7 @@ def create_reference_model(
 
 @dataclass
 class GRPOTrainerConfig:
-    # Official fields
+    # --- Official file's fields ---
     epsilon: float = 0.2
     epsilon_high: float = 0.28
     beta: float = 0.0
@@ -60,21 +60,18 @@ class GRPOTrainerConfig:
     repetition_penalty: float = 1.0
     num_iterations: int = 1
 
-    # --- Backend Switches ---
+    # --- ADDED: New configuration for backends ---
     use_vllm: bool = False
     use_bitsandbytes: bool = False
+    interactive_setup: bool = False
 
-    # --- Optimizer Config ---
     optimizer: Dict[str, Any] = field(default_factory=lambda: {
         "name": "adamw", "weight_decay": 0.01
     })
-
-    # --- vLLM Config ---
+    accelerate_memory: Dict[str, Any] = field(default_factory=lambda: {})
     vllm: Dict[str, Any] = field(default_factory=lambda: {
         "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1
     })
-
-    # --- BitsAndBytes Config ---
     bitsandbytes: Dict[str, Any] = field(default_factory=lambda: {
         "load_in_4bit": True, "load_in_8bit": False, "bnb_4bit_compute_dtype": "bfloat16", "bnb_4bit_quant_type": "nf4", "bnb_4bit_use_double_quant": True
     })
@@ -89,17 +86,48 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def __init__(self, models: List[Any], config: GRPOTrainerConfig, **kwargs):
         """
         Initialize the GRPO trainer module.
+
+        Args:
+            models: List containing the model to be trained.
+            **kwargs: Additional arguments for configuration.
         """
+        # --- Official file's __init__ logic ---
         if not models or len(models) < 1:
             raise ValueError("At least one model must be provided")
 
-        self.model = models[0]
+        self.model = models[
+            0
+        ]  # TODO(Discuss): How to settup multiple models here? Should be tethered to agent index that'll be given by gamestate. Maybe loop here and add a lil model ID datum to the gamestate?
+
         self.args = config
 
-        # If the optimizer name is 'choose', prompt the user to select one.
-        if self.args.optimizer.get("name") == "choose":
-            self._manually_select_optimizer()
-        
+        # --- ADDED: Interactive setup logic ---
+        if self.args.interactive_setup:
+            self._interactive_setup()
+
+        # --- MODIFIED: The original optimizer is replaced by the configurable one below ---
+
+        # Tokenizers
+        self.processing_class = kwargs.get("processing_class", None)
+
+        # Additional parameters
+        self.callbacks = kwargs.get("callbacks", [])
+        self.save_dir = kwargs.get("log_dir", "./outputs")
+        self.global_step = 0
+        assert (
+            self.args.num_generations > 1
+        ), f"For GRPO training, number of generations must be > 1, got {self.args.num_generations}"
+        self.dtype = DTYPE_MAP[self.args.dtype]
+        self.enable_gradient_checkpointing = self.args.enable_gradient_checkpointing
+
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
+        # --- MODIFIED: Initialization order adjusted to support new features ---
         print("\n--- GRPO Trainer Backend Configuration ---")
         if self.args.use_vllm:
             print("⚡️ vLLM Engine: Enabled for fast generation.")
@@ -110,20 +138,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         print(f"⚙️ Optimizer: Using {self.args.optimizer.get('name', 'adamw')}")
         print("-----------------------------------------\n")
 
-        self.processing_class = kwargs.get("processing_class", None)
-        self.callbacks = kwargs.get("callbacks", [])
-        self.save_dir = kwargs.get("log_dir", "./outputs")
-        self.global_step = 0
-        assert self.args.num_generations > 1, "GRPO requires num_generations > 1"
-        self.dtype = DTYPE_MAP[self.args.dtype]
-        self.enable_gradient_checkpointing = self.args.enable_gradient_checkpointing
-
-        if torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
-
-        # MODIFIED: Initialization order adjusted for new features
         self._initialize_model()
         self._initialize_tokenizers()
         self._initialize_optimizer()
@@ -132,23 +146,49 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         self._initialize_vllm_if_enabled()
         self.init_tracker(self.save_dir, log_with=kwargs.get("log_with", None))
 
+        # Verification print for the optimizer
         print(f"✅ VERIFICATION: Optimizer object created is of type: {type(self.optimizer)}")
+
+
+    # --- ADDED: New methods for interactive setup and backend initialization ---
+    def _interactive_setup(self):
+        """Presents a menu to the user to configure the trainer at runtime."""
+        print("\n--- Interactive Trainer Setup ---")
+        print("\n[Step 1] Choose your primary backend:")
+        print("1: BitsAndBytes (Memory-Efficient Training)")
+        print("2: vLLM (Fastest Generation)")
+        backend_choice = ""
+        while backend_choice not in ["1", "2"]:
+            backend_choice = input("Enter your choice (1-2): ")
+        if backend_choice == "1":
+            self.args.use_bitsandbytes = True
+            self.args.use_vllm = False
+            print("✅ BitsAndBytes enabled.")
+            print("\n[Step 2] Configure memory split for BitsAndBytes.")
+            print("The model's weights will be stored on the GPU. The rest is a buffer for training.")
+            mem_percent = -1
+            while not (0 < mem_percent <= 95):
+                try:
+                    mem_percent_str = input("Enter GPU memory % for the model (e.g., 40 for a 40%/60% split): ")
+                    mem_percent = int(mem_percent_str)
+                except ValueError:
+                    mem_percent = -1
+            self.args.accelerate_memory = {"max_memory_map": {0: f"{mem_percent}%"}}
+            print(f"✅ VRAM for model set to {mem_percent}%.")
+        elif backend_choice == "2":
+            self.args.use_vllm = True
+            self.args.use_bitsandbytes = False
+            print("✅ vLLM enabled.")
+        self._manually_select_optimizer()
 
     def _manually_select_optimizer(self):
         """Presents a menu to the user to select an optimizer at runtime."""
-        print("\n--- Please Select an Optimizer ---")
+        print("\n[Step 3] Please Select an Optimizer:")
         print("1: AdamW (Default, Good Performance)")
         print("2: AdamW_8bit (Best for VRAM Savings)")
         print("3: SGD (Low VRAM, can be slower)")
         print("4: Adafactor (Memory Efficient)")
-        
-        choice_map = {
-            "1": "adamw",
-            "2": "adamw_8bit",
-            "3": "sgd",
-            "4": "adafactor",
-        }
-        
+        choice_map = { "1": "adamw", "2": "adamw_8bit", "3": "sgd", "4": "adafactor" }
         while True:
             choice = input("Enter your choice (1-4): ")
             if choice in choice_map:
@@ -159,38 +199,11 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             else:
                 print("❌ Invalid choice. Please enter a number between 1 and 4.")
 
-    def _initialize_model(self):
-        """Initializes the training model, applying BitsAndBytes if configured."""
-        model_id = self.model.config._name_or_path
-        
-        if self.args.use_bitsandbytes:
-            if not _BNB_AVAILABLE: raise ImportError("`use_bitsandbytes=True` but bitsandbytes is not installed.")
-            if not torch.cuda.is_available(): raise RuntimeError("BitsAndBytes requires a CUDA-enabled GPU.")
-            bnb_config = self.args.bitsandbytes
-            compute_dtype = DTYPE_MAP.get(bnb_config["bnb_4bit_compute_dtype"], torch.bfloat16)
-            quant_cfg = BitsAndBytesConfig(
-                load_in_4bit=bnb_config["load_in_4bit"], load_in_8bit=bnb_config["load_in_8bit"], bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_quant_type=bnb_config["bnb_4bit_quant_type"], bnb_4bit_use_double_quant=bnb_config["bnb_4bit_use_double_quant"],
-            )
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_id, quantization_config=quant_cfg, device_map="auto", trust_remote_code=True
-            )
-        else:
-            self.model = self.model.to(device=self.device, dtype=self.dtype)
-            if self.enable_gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
-                self.model.gradient_checkpointing_enable()
-
-        if self.args.beta > 0.0:
-            self.ref_model = create_reference_model(self.model).to(device=self.device, dtype=self.dtype)
-        else:
-            self.ref_model = None
-
     def _initialize_optimizer(self):
         """Initializes the optimizer based on the config."""
         optimizer_name = self.args.optimizer.get("name", "adamw").lower()
         weight_decay = self.args.optimizer.get("weight_decay", 0.01)
         lr = self.args.learning_rate
-
         match optimizer_name:
             case "adamw_8bit":
                 if not self.args.use_bitsandbytes:
@@ -205,33 +218,62 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             case "sgd":
                 self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
             case "adafactor":
-                if Adafactor is None:
-                    raise ImportError("Cannot use Adafactor, please ensure transformers is installed correctly.")
+                if Adafactor is None: raise ImportError("Cannot use Adafactor, please ensure transformers is installed correctly.")
                 self.optimizer = Adafactor(self.model.parameters(), lr=lr, weight_decay=weight_decay, scale_parameter=False, relative_step=False)
             case _:
-                # Fallback to the original official optimizer
                 print(f"Warning: Unknown optimizer '{optimizer_name}'. Falling back to default Adam.")
                 self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-    
+
     def _initialize_vllm_if_enabled(self):
         self.vllm_engine = None
         if not self.args.use_vllm: return
         if not _VLLM_AVAILABLE: raise ImportError("`use_vllm=True` but vLLM isn't installed.")
-        
         model_name = self.model.config._name_or_path
         vllm_config = self.args.vllm
-        
         gpu_memory_utilization = vllm_config.get("gpu_memory_utilization", 0.9)
         if self.args.use_bitsandbytes:
             print("INFO: Hybrid mode detected. Automatically reducing vLLM memory utilization to prevent OOM.")
             gpu_memory_utilization = 0.5
-
         self.vllm_engine = LLM(
             model=model_name, trust_remote_code=True,
             tensor_parallel_size=vllm_config.get("tensor_parallel_size", 1),
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=4096, dtype=self.args.dtype,
         )
+
+    # --- MODIFIED: The original _initialize_model is now more advanced ---
+    def _initialize_model(self):
+        """Initializes the training model, applying BitsAndBytes if configured."""
+        model_id = self.model.config._name_or_path
+        if self.args.use_bitsandbytes:
+            if not _BNB_AVAILABLE: raise ImportError("`use_bitsandbytes=True` but bitsandbytes is not installed.")
+            if not torch.cuda.is_available(): raise RuntimeError("BitsAndBytes requires a CUDA-enabled GPU.")
+            bnb_config = self.args.bitsandbytes
+            compute_dtype = DTYPE_MAP.get(bnb_config["bnb_4bit_compute_dtype"], torch.bfloat16)
+            quant_cfg = BitsAndBytesConfig(
+                load_in_4bit=bnb_config["load_in_4bit"], load_in_8bit=bnb_config["load_in_8bit"], bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_quant_type=bnb_config["bnb_4bit_quant_type"], bnb_4bit_use_double_quant=bnb_config["bnb_4bit_use_double_quant"],
+            )
+            max_memory = self.args.accelerate_memory.get("max_memory_map")
+            if max_memory:
+                print(f"INFO: Applying custom accelerate memory map: {max_memory}")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_id, quantization_config=quant_cfg, device_map="auto", max_memory=max_memory, trust_remote_code=True
+            )
+            if self.enable_gradient_checkpointing:
+                self.model.gradient_checkpointing_enable()
+        else:
+            # This is the original logic from the official file
+            self.model = self.model.to(device=self.device, dtype=self.dtype)
+            if self.enable_gradient_checkpointing:
+                self.model.gradient_checkpointing_enable()
+
+        # This is also from the official file
+        if self.args.beta == 0.0:
+            self.ref_model = None
+        else:
+            self.ref_model = create_reference_model(self.model).to(device=self.device, dtype=self.dtype)
+
 
     # --- The rest of the file is your official version, UNTOUCHED ---
     def _initialize_tokenizers(self):
@@ -240,8 +282,6 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             self.processing_class = AutoTokenizer.from_pretrained(
                 self.model.config._name_or_path, padding_side="left"
             )
-        if self.processing_class.pad_token is None:
-            self.processing_class.pad_token = self.processing_class.eos_token
 
     def _initialize_metrics(self):
         """Initialize metrics tracking for training and evaluation."""
@@ -315,8 +355,8 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         for _ in range(self.args.num_generations):
             with torch.no_grad():
                 outputs = self.model.generate(
-                    input_tokens.input_ids.to(self.device),
-                    attention_mask=input_tokens.attention_mask.to(self.device, dtype=self.dtype),
+                    input_tokens.input_ids.to(self.model.device),
+                    attention_mask=input_tokens.attention_mask.to(self.model.device, dtype=self.dtype),
                     generation_config=self.generation_config,
                 )
 
@@ -518,15 +558,11 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
         loss.backward()
         self.optimizer.step()
-        
-        # --- THIS IS THE FIX ---
-        # The log was happening before the gradients were zeroed, causing the print.
-        # This reorders the operations to match best practices.
+        self.model.zero_grad()
+
         metrics = {"train/loss": loss.cpu().mean().item()}
         metrics.update({"train/rewards": rewards.cpu().mean().item()})
-        # self.log(metrics, global_step) # Log metrics to wandb
-        self.optimizer.zero_grad()   # Zero gradients *after* logging
-        # ---------------------
+        self.log(metrics, global_step)
 
         self.cleanup_step()
 
