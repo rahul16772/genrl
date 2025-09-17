@@ -3,27 +3,18 @@ import os
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-# --- Optional dependencies ---
 try:
-    from vllm import LLM, SamplingParams
-    _VLLM_AVAILABLE = True
-except Exception:
-    LLM, SamplingParams = None, False
-    _VLLM_AVAILABLE = False
-
-try:
-    # ADDED: Adafactor for the new optimizer option
-    from transformers import BitsAndBytesConfig, Adafactor
-    import bitsandbytes as bnb
+    from transformers import BitsAndBytesConfig
     _BNB_AVAILABLE = True
 except Exception:
-    BitsAndBytesConfig, bnb, Adafactor = None, None, None
+    BitsAndBytesConfig = None
     _BNB_AVAILABLE = False
+# ----------------------------------------------------
 
 from genrl.data import DataManager
 from genrl.logging_utils.ml_logger import LoggerMixin
@@ -31,8 +22,6 @@ from genrl.rewards import RewardManager
 from genrl.state import GameState
 from genrl.trainer import TrainerModule
 from genrl.trainer.trainer_utils import DTYPE_MAP
-
-
 
 def create_reference_model(
     model: torch.nn.Module
@@ -44,7 +33,7 @@ def create_reference_model(
 
 @dataclass
 class GRPOTrainerConfig:
-    # Official fields
+    # --- Official file's fields ---
     epsilon: float = 0.2
     epsilon_high: float = 0.28
     beta: float = 0.0
@@ -60,25 +49,8 @@ class GRPOTrainerConfig:
     repetition_penalty: float = 1.0
     num_iterations: int = 1
 
-    # --- Backend Switches ---
-    use_vllm: bool = False
+    # --- ADDED: New configuration for bitsandbytes ---
     use_bitsandbytes: bool = False
-    interactive_setup: bool = False
-
-    # --- Optimizer Config ---
-    optimizer: Dict[str, Any] = field(default_factory=lambda: {
-        "name": "adamw", "weight_decay": 0.01
-    })
-    
-    # --- Accelerate Memory Config ---
-    accelerate_memory: Dict[str, Any] = field(default_factory=lambda: {})
-
-    # --- vLLM Config ---
-    vllm: Dict[str, Any] = field(default_factory=lambda: {
-        "gpu_memory_utilization": 0.9, "tensor_parallel_size": 1
-    })
-
-    # --- BitsAndBytes Config ---
     bitsandbytes: Dict[str, Any] = field(default_factory=lambda: {
         "load_in_4bit": True, "load_in_8bit": False, "bnb_4bit_compute_dtype": "bfloat16", "bnb_4bit_quant_type": "nf4", "bnb_4bit_use_double_quant": True
     })
@@ -93,179 +65,81 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def __init__(self, models: List[Any], config: GRPOTrainerConfig, **kwargs):
         """
         Initialize the GRPO trainer module.
+
+        Args:
+            models: List containing the model to be trained.
+            **kwargs: Additional arguments for configuration.
         """
+        # Extract model and reward functions
         if not models or len(models) < 1:
             raise ValueError("At least one model must be provided")
 
-        self.model = models[0]
+        self.model = models[
+            0
+        ]  # TODO(Discuss): How to settup multiple models here? Should be tethered to agent index that'll be given by gamestate. Maybe loop here and add a lil model ID datum to the gamestate?
+
         self.args = config
 
-        # --- Interactive setup logic ---
-        if self.args.interactive_setup:
-            self._interactive_setup()
-        
-        print("\n--- GRPO Trainer Backend Configuration ---")
-        if self.args.use_vllm:
-            print("⚡️ vLLM Engine: Enabled for fast generation.")
-        elif self.args.use_bitsandbytes:
-            print("✅ BitsAndBytes: Enabled for model quantization.")
-        else:
-            print("⚪️ Standard Mode: Using default Hugging Face backend.")
-        print(f"⚙️ Optimizer: Using {self.args.optimizer.get('name', 'adamw')}")
-        print("-----------------------------------------\n")
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=self.args.learning_rate
+        )
 
+        # Tokenizers
         self.processing_class = kwargs.get("processing_class", None)
+
+        # Additional parameters
         self.callbacks = kwargs.get("callbacks", [])
         self.save_dir = kwargs.get("log_dir", "./outputs")
         self.global_step = 0
-        assert self.args.num_generations > 1, "GRPO requires num_generations > 1"
+        assert (
+            self.args.num_generations > 1
+        ), f"For GRPO training, number of generations must be > 1, got {self.args.num_generations}"
         self.dtype = DTYPE_MAP[self.args.dtype]
         self.enable_gradient_checkpointing = self.args.enable_gradient_checkpointing
 
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
         else:
             self.device = torch.device("cpu")
 
-        # MODIFIED: Initialization order adjusted for new features
-        self._initialize_model()
+        # Initialize core components
+        self._initialize_model(self.enable_gradient_checkpointing)
         self._initialize_tokenizers()
-        self._initialize_optimizer()
         self._initialize_metrics()
         self._initialize_generation_config()
-        self._initialize_vllm_if_enabled()
         self.init_tracker(self.save_dir, log_with=kwargs.get("log_with", None))
 
-        # Verification print for the optimizer
-        print(f"✅ VERIFICATION: Optimizer object created is of type: {type(self.optimizer)}")
-
-
-    def _interactive_setup(self):
-        """Presents a menu to the user to configure the trainer at runtime."""
-        print("\n--- Interactive Trainer Setup ---")
-        print("\n[Step 1] Choose your primary backend:")
-        print("1: BitsAndBytes (Memory-Efficient Training)")
-        print("2: vLLM (Fastest Generation)")
-        backend_choice = ""
-        while backend_choice not in ["1", "2"]:
-            backend_choice = input("Enter your choice (1-2): ")
-        if backend_choice == "1":
-            self.args.use_bitsandbytes = True
-            self.args.use_vllm = False
-            print("✅ BitsAndBytes enabled.")
-            print("\n[Step 2] Configure memory split for BitsAndBytes.")
-            print("The model's weights will be stored on the GPU. The rest is a buffer for training.")
-            mem_percent = -1
-            while not (0 < mem_percent <= 95):
-                try:
-                    mem_percent_str = input("Enter GPU memory % for the model (e.g., 40 for a 40%/60% split): ")
-                    mem_percent = int(mem_percent_str)
-                except ValueError:
-                    mem_percent = -1
-
-            # --- THIS IS THE FIX ---
-            # Calculate the absolute memory in GB and format it correctly for accelerate.
-            if torch.cuda.is_available():
-                total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                model_mem_gb = total_mem_gb * (mem_percent / 100.0)
-                max_memory_str = f"{model_mem_gb:.2f}GB"
-                self.args.accelerate_memory = {"max_memory_map": {0: max_memory_str}}
-                print(f"✅ VRAM for model set to {mem_percent}% ({max_memory_str}).")
-            else:
-                print("⚠️ CUDA not available. Cannot set memory map.")
-            # ---------------------
-
-        elif backend_choice == "2":
-            self.args.use_vllm = True
-            self.args.use_bitsandbytes = False
-            print("✅ vLLM enabled.")
-        self._manually_select_optimizer()
-
-    def _manually_select_optimizer(self):
-        """Presents a menu to the user to select an optimizer at runtime."""
-        print("\n[Step 3] Please Select an Optimizer:")
-        print("1: AdamW (Default, Good Performance)")
-        print("2: AdamW_8bit (Best for VRAM Savings)")
-        print("3: SGD (Low VRAM, can be slower)")
-        print("4: Adafactor (Memory Efficient)")
-        choice_map = { "1": "adamw", "2": "adamw_8bit", "3": "sgd", "4": "adafactor" }
-        while True:
-            choice = input("Enter your choice (1-4): ")
-            if choice in choice_map:
-                chosen_optimizer = choice_map[choice]
-                self.args.optimizer["name"] = chosen_optimizer
-                print(f"✅ You have selected: {chosen_optimizer}")
-                return
-            else:
-                print("❌ Invalid choice. Please enter a number between 1 and 4.")
-
-    def _initialize_optimizer(self):
-        """Initializes the optimizer based on the config."""
-        optimizer_name = self.args.optimizer.get("name", "adamw").lower()
-        weight_decay = self.args.optimizer.get("weight_decay", 0.01)
-        lr = self.args.learning_rate
-        match optimizer_name:
-            case "adamw_8bit":
-                if not self.args.use_bitsandbytes:
-                    print("Warning: `use_bitsandbytes` is false. Falling back to standard AdamW optimizer.")
-                    self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-                elif not _BNB_AVAILABLE:
-                    raise ImportError("Cannot use 8-bit AdamW, bitsandbytes is not installed.")
-                else:
-                    self.optimizer = bnb.optim.AdamW8bit(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-            case "adamw":
-                self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=weight_decay)
-            case "sgd":
-                self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
-            case "adafactor":
-                if Adafactor is None: raise ImportError("Cannot use Adafactor, please ensure transformers is installed correctly.")
-                self.optimizer = Adafactor(self.model.parameters(), lr=lr, weight_decay=weight_decay, scale_parameter=False, relative_step=False)
-            case _:
-                print(f"Warning: Unknown optimizer '{optimizer_name}'. Falling back to default Adam.")
-                self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-
-    def _initialize_vllm_if_enabled(self):
-        self.vllm_engine = None
-        if not self.args.use_vllm: return
-        if not _VLLM_AVAILABLE: raise ImportError("`use_vllm=True` but vLLM isn't installed.")
-        model_name = self.model.config._name_or_path
-        vllm_config = self.args.vllm
-        gpu_memory_utilization = vllm_config.get("gpu_memory_utilization", 0.9)
-        if self.args.use_bitsandbytes:
-            print("INFO: Hybrid mode detected. Automatically reducing vLLM memory utilization to prevent OOM.")
-            gpu_memory_utilization = 0.5
-        self.vllm_engine = LLM(
-            model=model_name, trust_remote_code=True,
-            tensor_parallel_size=vllm_config.get("tensor_parallel_size", 1),
-            gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=4096, dtype=self.args.dtype,
-        )
-
-    def _initialize_model(self):
-        """Initializes the training model, applying BitsAndBytes if configured."""
+    # --- MODIFIED: This method now handles bitsandbytes ---
+    def _initialize_model(self, enable_gradient_checkpointing):
+        """Initialize the model and reference model."""
         model_id = self.model.config._name_or_path
+        
         if self.args.use_bitsandbytes:
+            print("\n✅ BitsAndBytes: Enabled for model quantization.\n")
             if not _BNB_AVAILABLE: raise ImportError("`use_bitsandbytes=True` but bitsandbytes is not installed.")
             if not torch.cuda.is_available(): raise RuntimeError("BitsAndBytes requires a CUDA-enabled GPU.")
+            
             bnb_config = self.args.bitsandbytes
             compute_dtype = DTYPE_MAP.get(bnb_config["bnb_4bit_compute_dtype"], torch.bfloat16)
             quant_cfg = BitsAndBytesConfig(
                 load_in_4bit=bnb_config["load_in_4bit"], load_in_8bit=bnb_config["load_in_8bit"], bnb_4bit_compute_dtype=compute_dtype,
                 bnb_4bit_quant_type=bnb_config["bnb_4bit_quant_type"], bnb_4bit_use_double_quant=bnb_config["bnb_4bit_use_double_quant"],
             )
-            max_memory = self.args.accelerate_memory.get("max_memory_map")
-            if max_memory:
-                print(f"INFO: Applying custom accelerate memory map: {max_memory}")
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_id, quantization_config=quant_cfg, device_map="auto", max_memory=max_memory, trust_remote_code=True
+                model_id, quantization_config=quant_cfg, device_map="auto", trust_remote_code=True
             )
-            if self.enable_gradient_checkpointing:
+            
+            if enable_gradient_checkpointing:
                 self.model.gradient_checkpointing_enable()
         else:
+            # This is the original logic from the official file
             self.model = self.model.to(device=self.device, dtype=self.dtype)
-            if self.enable_gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
+            if enable_gradient_checkpointing:
                 self.model.gradient_checkpointing_enable()
 
+        # Reference model setup
         if self.args.beta == 0.0:
             self.ref_model = None
         else:
@@ -308,7 +182,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
         if (
             with_template
-        ):
+        ):  # Pick up here!!!! Remove the for generation arg and instead unflatten the templated prompts to get back tensor of shape [batch size, completions, tokens]
             if for_training:
                 templated_prompts = []
                 for item in inputs:
@@ -321,12 +195,13 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                     self.processing_class.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True)
                     for item in inputs
                 ]
+
         else:
             if for_training:
                 templated_prompts = []
                 for generations in inputs:
                     for output in generations:
-                        templated_prompts.append(output)
+                        templated_prompts.append(output)  # [item[0] for item in inputs]
             else:
                 templated_prompts = [item[0] for item in inputs]
 
@@ -340,15 +215,20 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     ) -> Any:
         """
         Generate outputs from the model for the given inputs.
-        """
-        if self.vllm_engine:
-            prompts = [self.processing_class.apply_chat_template(item["prompt"], tokenize=False, add_generation_prompt=True) for item in inputs]
-            sampling = SamplingParams(n=self.args.num_generations, temperature=self.args.temperature, top_p=self.args.top_p, max_tokens=self.args.max_new_tokens)
-            outputs = self.vllm_engine.generate(prompts, sampling_params=sampling, use_tqdm=False)
-            return [[o.text for o in out.outputs] for out in outputs]
 
+        Args:
+            inputs: Input data for generation
+            return_completion_ids: Whether to return completion IDs along with text
+            stage: Current stage (0, 1, or 2) for proper output formatting
+
+        Returns:
+            Generated outputs in the format expected by the next stage
+        """
         input_tokens = self._process_inputs(inputs)
-        rollout, rollout_ids = ([], [])
+        rollout, rollout_ids = (
+            [],
+            [],
+        )  # TODO: Revisit this for getting a larger number of completions. Super hacky and ugly currently.
         for _ in range(self.args.num_generations):
             with torch.no_grad():
                 outputs = self.model.generate(
@@ -357,6 +237,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                     generation_config=self.generation_config,
                 )
 
+            # Extract completions (i.e., removes prompt part)
             prompt_length = input_tokens.input_ids.size(1)
             completion_ids = outputs[:, prompt_length:]
 
@@ -379,19 +260,33 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             return rollout
 
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
-        """Get the per-token log probabilities for the input tokens."""
-        outputs = model(
+        """Get the per-token log probabilities for the input tokens.
+
+        Args:
+            model: The model to compute log probabilities for.
+            input_ids: The input token IDs.
+            attention_mask: The attention mask.
+            logits_to_keep: The number of logits to keep.
+
+        Returns:
+            The per-token log probabilities.
+        """
+        # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+        logits = model(
             input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        logits = outputs.logits
-        logits = logits[:, :-1, :]
+            attention_mask=attention_mask,
+        ).logits
+        logits = logits[
+            :, :-1, :
+        ]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
 
         loss_mask = (
             attention_mask[:, -logits_to_keep:].to(device=logits.device, dtype=logits.dtype).contiguous()
         )
         labels = input_ids[:, -logits_to_keep:].contiguous()
+        # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         logits = logits[:, -logits_to_keep:].contiguous()
+        # Divide logits by sampling temperature.
         logits = logits / self.args.temperature
         logits_shape = logits.shape
         token_log_probs = -torch.nn.functional.cross_entropy(
@@ -403,27 +298,44 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
             token_log_probs * loss_mask
             + (1.0 - loss_mask) * torch.finfo(logits.dtype).min
         )
-        return token_log_probs
+        return token_log_probs  # compute logprobs for the input tokens
 
     def compute_loss(
         self, model, inputs, mode="train", return_metrics=False
     ):
-        """Compute the GRPO loss."""
+        """Compute the GRPO loss.
+
+        Args:
+            model: The model to compute the loss for.
+            inputs: The inputs containing prompt_ids, prompt_mask, completion_ids, completion_mask,
+                    old_per_token_logps, ref_per_token_logps, and advantages.
+
+        Returns:
+            The loss value and metrics.
+        """
+
+        # Extract inputs
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = (
             inputs["completion_ids"],
             inputs["completion_mask"],
         )
+
+        # Concatenate prompt and completion
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1).to(self.model.device)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(
             self.model.device, dtype=self.dtype
         )
-        logits_to_keep = completion_ids.size(1)
+        logits_to_keep = completion_ids.size(
+            1
+        )  # we only need to compute the logits for the completion tokens
 
+        # Compute per-token log probabilities
         per_token_logps = self._get_per_token_logps(
             model, input_ids, attention_mask, logits_to_keep
         )
 
+        # Compute KL divergence between model and reference model if beta > 0
         if self.args.beta != 0.0:
             if self.ref_model is not None:
                 ref_per_token_logps = self._get_per_token_logps(
@@ -438,13 +350,16 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
                 - 1
             )
 
+        # Compute the loss
         advantages = inputs["advantages"]
+        # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip its computation
         old_per_token_logps = (
             inputs["old_per_token_logps"]
             if self.args.num_iterations > 1
             else per_token_logps.detach()
         )
 
+        # Calculate ratios and loss terms
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         coef_2 = torch.clamp(
             coef_1,
@@ -457,12 +372,13 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         per_token_loss2 = coef_2 * advantages
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
+        # Add KL penalty if beta > 0
         if self.args.beta != 0.0:
             per_token_loss = per_token_loss + self.args.beta * per_token_kl
 
+        # Final loss calculation
         loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
-        mean_kl = None
         if self.args.beta != 0.0:
             mean_kl = (per_token_kl * completion_mask).sum() / completion_mask.sum()
             self._metrics[mode]["kl"].append(mean_kl.item())
@@ -472,6 +388,7 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
         self._metrics[mode]["clip_ratio"].append(clip_ratio.item())
         self._metrics[mode]["loss"].append(loss.item())
 
+        # return for tensorboard
         metrics = {
             "loss": loss.item(),
             "kl": mean_kl.item() if self.args.beta != 0.0 else None,
@@ -488,6 +405,10 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     ) -> None:
         """
         Train the model using the given game state and reward manager.
+
+        Args:
+            game_state: The current game state.
+            reward_manager: The reward manager to use for computing rewards.
         """
         self.model.train()
         global_step = self.global_step
@@ -508,9 +429,15 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     ) -> int:
         global_step += 1
 
-        stage_inputs = state.get_stage_state(stage)
-        stage_inputs, index_mapping = data_manager.prepare_input(stage_inputs, stage)
+        # Prepare stage's inputs
+        stage_inputs = state.get_stage_state(
+            stage
+        )  # Fetches the current world state for all agents
+        stage_inputs, index_mapping = data_manager.prepare_input(
+            stage_inputs, stage
+        )  # Maps game tree states to model ingestable inputs
         assert stage_inputs is not None, f"No inputs found for stage {stage}"
+        # Unflatten stage's outputs
         stage_actions = state.get_stage_actions(stage)
         stage_outputs = [
             stage_actions[index_mapping[idx][0]][index_mapping[idx][1]][
@@ -574,6 +501,9 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
     def save(self, save_dir: str) -> None:
         """
         Save the model and trainer state to the given directory.
+
+        Args:
+            save_dir: The directory to save to.
         """
         os.makedirs(save_dir, exist_ok=True)
         
@@ -617,3 +547,4 @@ class GRPOLanguageTrainerModule(TrainerModule, LoggerMixin):
 
     def cleanup(self):
         self.cleanup_trackers()
+
